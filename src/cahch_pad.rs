@@ -36,7 +36,6 @@ unsafe impl<T: Send> Send for CachePad<T> {}
 unsafe impl<T: Sync> Sync for CachePad<T> {}
 
 impl<T> CachePad<T> {
-
     pub fn new(t: T) -> CachePad<T> {
         CachePad::<T> { value: t }
     }

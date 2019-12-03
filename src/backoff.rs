@@ -34,6 +34,7 @@ impl Backoff {
                 atomic::spin_loop_hint();
             }
         } else {
+            println!("yield now");
             ::std::thread::yield_now();
         }
 

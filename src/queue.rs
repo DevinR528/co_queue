@@ -1,16 +1,21 @@
 use std::cell::UnsafeCell;
-use std::collections::VecDeque;
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop};
+use std::pin::Pin;
 use std::ptr;
-use std::task::{Context, Poll};
+use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvError, SendError, Sender};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
-use std::sync::mpsc::{channel, Sender, SendError, Receiver, RecvError};
-use std::sync::atomic::{self, AtomicBool, AtomicUsize, AtomicPtr, Ordering};
 
-use crate::cahch_pad::CachePad;
+use futures_core::stream::Stream;
+
 use crate::backoff::Backoff;
+use crate::cahch_pad::CachePad;
+use crate::stream::QueueState;
 
 // Bits indicating the state of a slot:
 // * If a value has been written into the slot, `WRITE` is set.
@@ -37,9 +42,7 @@ struct Slot<T> {
 impl<T> Slot<T> {
     fn wait_write(&self) {
         let backoff = Backoff::new();
-        println!("wait_write {}", self.state.load(Ordering::Acquire));
         while self.state.load(Ordering::Acquire) & WRITE == 0 {
-            println!("still waiting to write");
             backoff.nap();
         }
     }
@@ -65,7 +68,6 @@ impl<T> Chunk<T> {
             if !next.is_null() {
                 return next;
             }
-            println!("nap in wait_next");
             backoff.nap();
         }
     }
@@ -74,7 +76,7 @@ impl<T> Chunk<T> {
         for i in start..CHUNK_CAP {
             let slot = (*this).slots.get_unchecked(i);
 
-            if slot.state.load(Ordering::Acquire) & READ == 0 
+            if slot.state.load(Ordering::Acquire) & READ == 0
                 && slot.state.fetch_or(DESTROY, Ordering::AcqRel) & READ == 0
             {
                 println!("no drop still in use");
@@ -104,10 +106,11 @@ impl<T> Segment<T> {
 
 /// TODO ordering will be important
 /// have a listener method to get mpsc::Reciver
-#[derive(Debug)]
 pub struct CoQueue<T> {
     head: CachePad<Segment<T>>,
     tail: CachePad<Segment<T>>,
+    pub(crate) recv: Receiver<QueueState<T>>,
+    pub(crate) temp_tx: Sender<QueueState<T>>,
     _mkr: PhantomData<T>,
 }
 
@@ -115,9 +118,9 @@ unsafe impl<T: Send> Send for CoQueue<T> {}
 unsafe impl<T: Sync> Sync for CoQueue<T> {}
 
 impl<T> CoQueue<T> {
-
     pub fn new() -> CoQueue<T> {
-        Self { 
+        let (tx, recv) = channel();
+        Self {
             head: CachePad::new(Segment {
                 chunk: AtomicPtr::new(ptr::null_mut()),
                 index: AtomicUsize::new(0),
@@ -126,6 +129,8 @@ impl<T> CoQueue<T> {
                 chunk: AtomicPtr::new(ptr::null_mut()),
                 index: AtomicUsize::new(0),
             }),
+            recv,
+            temp_tx: tx,
             _mkr: PhantomData,
         }
     }
@@ -153,7 +158,12 @@ impl<T> CoQueue<T> {
             if chunk.is_null() {
                 let new = Box::into_raw(Box::new(Chunk::<T>::new()));
 
-                if self.tail.chunk.compare_and_swap(chunk, new, Ordering::Release) == chunk {
+                if self
+                    .tail
+                    .chunk
+                    .compare_and_swap(chunk, new, Ordering::Release)
+                    == chunk
+                {
                     self.head.chunk.store(new, Ordering::Release);
                     chunk = new;
                 } else {
@@ -166,9 +176,13 @@ impl<T> CoQueue<T> {
             let new_tail = tail + (1 << SHIFT);
 
             // move tail forward
-            match self.tail.index.compare_exchange_weak(tail, new_tail, Ordering::SeqCst, Ordering::Acquire) {
+            match self.tail.index.compare_exchange_weak(
+                tail,
+                new_tail,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => unsafe {
-                    println!("push match ok");
                     if offset + 1 == CHUNK_CAP {
                         let next_chunk = Box::into_raw(next_chunk.unwrap());
                         let next_idx = new_tail.wrapping_add(1 << SHIFT);
@@ -181,32 +195,30 @@ impl<T> CoQueue<T> {
                     let slot = (*chunk).slots.get_unchecked(offset);
                     slot.value.get().write(ManuallyDrop::new(item));
                     slot.state.fetch_or(WRITE, Ordering::Release);
-                    
+
                     return;
                 },
                 Err(t) => {
-                    println!("push match err");
                     tail = t;
                     chunk = self.tail.chunk.load(Ordering::Acquire);
                     backoff.spin();
-                },
+                }
             }
         }
     }
 
-    pub fn pop(&self) -> Result<T, ()> 
+    pub fn pop(&self) -> Result<T, ()>
     where
         T: std::fmt::Debug,
     {
         let backoff = Backoff::new();
         let mut head = self.head.index.load(Ordering::Acquire);
         let mut chunk = self.head.chunk.load(Ordering::Acquire);
-        
+
         loop {
-            println!("HEAD {}", head);
+            // println!("HEAD {}", head);
             // head left shift 1 mod 32
             let offset = (head >> SHIFT) % LAP;
-            println!("offset {}", offset);
             if offset == CHUNK_CAP {
                 backoff.nap();
                 head = self.head.index.load(Ordering::Acquire);
@@ -215,22 +227,19 @@ impl<T> CoQueue<T> {
             }
 
             let mut new_head = head + (1 << SHIFT);
-            println!("new head {}", new_head);
+            //println!("new head {}", new_head);
             if new_head & HAS_NEXT == 0 {
-                println!("in has next");
                 atomic::fence(Ordering::SeqCst);
                 let tail = self.tail.index.load(Ordering::Relaxed);
-                println!("tail {} head {}", tail >> SHIFT, head >> SHIFT);
+
                 // If the tail equals the head, that means the queue is empty.
                 if head >> SHIFT == tail >> SHIFT {
-                    println!("return err");
                     return Err(());
                 }
 
                 // If head and tail are not in the same block, set `HAS_NEXT` in head.
                 if (head >> SHIFT) / LAP != (tail >> SHIFT) / LAP {
                     new_head |= HAS_NEXT;
-                    println!("new head shift {}", new_head);
                 }
             }
 
@@ -241,7 +250,12 @@ impl<T> CoQueue<T> {
                 continue;
             }
             // move head forward
-            match self.head.index.compare_exchange_weak(head, new_head, Ordering::SeqCst, Ordering::Acquire) {
+            match self.head.index.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => unsafe {
                     if offset + 1 == CHUNK_CAP {
                         let next = (*chunk).wait_next();
@@ -258,7 +272,7 @@ impl<T> CoQueue<T> {
                     slot.wait_write();
                     let m = slot.value.get().read();
                     let item = ManuallyDrop::into_inner(m);
-                    
+
                     // Destroy the chunk if we've reached the end, or if another thread wanted to
                     // destroy but couldn't because we were busy reading from the slot.
                     if offset + 1 == CHUNK_CAP {
@@ -266,15 +280,14 @@ impl<T> CoQueue<T> {
                     } else if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
                         Chunk::destroy(chunk, offset + 1);
                     }
-                    println!("pop return {:?}", item);
+                    // println!("pop return {:?}", item);
                     return Ok(item);
                 },
                 Err(h) => {
-                    println!("match err in pop {}", h);
                     head = h;
                     chunk = self.head.chunk.load(Ordering::Acquire);
                     backoff.spin();
-                },
+                }
             }
         }
     }
@@ -320,9 +333,15 @@ impl<T> CoQueue<T> {
             }
         }
     }
+}
 
-    pub fn listener(&self) -> Receiver<T> {
-        channel().1
+impl<T> fmt::Debug for CoQueue<T>
+where
+    T: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // f.debug_list().entries(self.iter()).finish()
+        f.debug_list().entry(&self.head).entry(&self.tail).finish()
     }
 }
 
@@ -365,30 +384,10 @@ impl<T> Drop for CoQueue<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use super::*;
     use crossbeam::scope;
+    use std::time::Duration;
 
-    fn concurrent_queue() {
-        let mut x = 0;
-
-        let mut que = CoQueue::new();
-
-        let rx = que.listener();
-
-        let job = || {
-            let mut y = x;
-            y += 1;
-            thread::sleep(Duration::from_millis(100));
-            println!("{}", y)
-        };
-
-        for i in 0..5 {
-            que.push(job.clone());
-        }
-
-    }
-    
     #[test]
     fn spsc() {
         const COUNT: usize = 10;
@@ -419,7 +418,7 @@ mod tests {
 
     #[test]
     fn mpmc() {
-        const COUNT: usize = 5;
+        const COUNT: usize = 20;
         const THREADS: usize = 4;
 
         let q = CoQueue::<usize>::new();
@@ -451,5 +450,39 @@ mod tests {
         for c in v {
             assert_eq!(c.load(Ordering::SeqCst), THREADS);
         }
+    }
+
+    #[test]
+    fn ordering() {
+        let arr: &[AtomicPtr<u8>; 5] = &[
+            AtomicPtr::new(ptr::null_mut()),
+            AtomicPtr::new(ptr::null_mut()),
+            AtomicPtr::new(ptr::null_mut()),
+            AtomicPtr::new(ptr::null_mut()),
+            AtomicPtr::new(ptr::null_mut()),
+        ];
+
+        // while arr[0].load(Ordering::Acquire).is_null() {
+        //     for i in 0..5 {
+        //         unsafe {
+        //             let y = arr[i].load(Ordering::Acquire);
+        //             println!("outside {:?}", y.as_ref());
+        //         }
+        //     }
+        // }
+        let _ = scope(|scope| {
+            scope.spawn(move |_| unsafe {
+                for i in 0..5 {
+                    let new = Box::into_raw(Box::new(i as u8));
+                    arr[i].store(new, Ordering::Release);
+                }
+                for i in 0..5 {
+                    thread::sleep_ms(100);
+                    let y = arr[i].load(Ordering::Acquire);
+                    println!("{:?}", y.as_ref());
+                }
+            });
+        })
+        .unwrap();
     }
 }

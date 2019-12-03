@@ -3,8 +3,10 @@
 [![Build Status](https://travis-ci.com/DevinR528/spans.svg?branch=master)](https://travis-ci.com/DevinR528/co_queue)
 [![Latest Version](https://img.shields.io/crates/v/spans.svg)](https://crates.io/crates/co_queue)
 
-A rust implementation of C#'s `Span<T>` and `Memory<T>`. Provides zero copy slicing, indexing,
-and iteration of any contiguous memory type (arrays, slices, vecs, ect).
+A rust nod to C#'s `ConcurrentQueue`. Provides an infinite streaming iterator that can be pushed to 
+from multiple threads a mpsc queue based on crossbeam's `SegQueue`.
+<br>
+Exploration of possible PR to crossbeam or an extension trait crate.
 
 ## Use
 ```toml
@@ -14,27 +16,71 @@ co_queue = "0.1"
 spawning threads and communicating with the main thread.
 
 ## Examples
-Handle expensive tasks on a separate thread. 
+Handle expensive tasks on a separate thread as an iterator or stream.
+### Iterator
 ```rust
-use std::thread;
-use co_queue::CoQueue;
-use std::time::Duration;
+fn streaming_iter_que() {
+    let mut x = 0;
 
-let mut x = 0;
+    let que = CoQueue::new();
+    let sender = que.sender();
 
-let mut que = CoQueue::new();
-let rx = que.listener();
+    let mut thread_que: RwLock<CoQueue<u8>> = RwLock::new(que);
 
-let job = || {
-    thread::sleep(Duration::from_millis(100));
-    x += 1;
-    println!("{}", x)
-};
+    scope(|scope| {
+        scope.spawn(|_| {
+            for i in 0..5 {
+                thread_que.write().unwrap().push(i);
+            }
+            println!("{:?}", thread_que.read().unwrap().len());
+        });
 
-for i in 0..5 {
-    que.push(job);
+    }).unwrap();
+
+    scope(|scope| {
+        scope.spawn(|_| {
+            thread::sleep(Duration::from_millis(100));
+            for (i, res) in thread_que.get_mut().unwrap().into_iter().enumerate()  {
+                if i == 5 {
+                    sender.lock().unwrap().send(QueueState::Terminate).unwrap();
+                }
+                println!("{:?}", res);
+            }
+        });
+    }).unwrap();
 }
+```
+### Stream
+```rust
+fn stream_que() {
+    let mut x = 0;
 
+    let que = CoQueue::new();
+    let sender = que.sender();
+
+    let mut thread_que: RwLock<CoQueue<u8>> = RwLock::new(que);
+
+    scope(|scope| {
+        scope.spawn(|_| {
+            // thread::sleep(Duration::from_millis(100));
+            for i in 0..5 {
+                thread_que.write().unwrap().push(i);
+            }
+        });
+
+    }).unwrap();
+    scope(|scope| {
+        scope.spawn(|_| {
+            // thread::sleep(Duration::from_millis(100));
+            for _ in 0..5  {
+                futures::executor::block_on(async {
+                    let res = thread_que.get_mut().unwrap().next().await;
+                    println!("{:?}", res);
+                });
+            }
+        });
+    }).unwrap();
+}
 ```
 more docs to come!
 
