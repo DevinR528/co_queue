@@ -10,7 +10,7 @@ Exploration of possible PR to crossbeam or an extension trait crate.
 
 ## Use
 ```toml
-co_queue = "0.1"
+co_queue = "0.1" # NOT YET
 ```
 `CoQueue` is a simple collection that you push "jobs" into and the `CoQueue` handles
 spawning threads and communicating with the main thread.
