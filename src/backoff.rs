@@ -36,6 +36,7 @@ impl Backoff {
             }
         } else {
             // println!("yield now");
+            std::sync::Condvar::new();
             ::std::thread::yield_now();
         }
 

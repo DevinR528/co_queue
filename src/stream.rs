@@ -10,6 +10,29 @@ use futures_core::stream::Stream;
 use crate::waker;
 use crate::CoQueue;
 
+macro_rules! pin_mut {
+    ($x:ident) => {
+        // Move the value to ensure that it is owned
+        let mut $x = $x;
+        // Shadow the original binding so that it can't be directly accessed
+        // ever again.
+        #[allow(unused_mut)]
+        let mut $x = unsafe {
+            ::std::pin::Pin::new_unchecked(&mut $x)
+        };
+    };
+    (&mut $x:ident) => {
+        // Move the value to ensure that it is owned
+        let $x = $x;
+        // Shadow the original binding so that it can't be directly accessed
+        // ever again.
+        #[allow(unused_mut)]
+        let mut $x = unsafe {
+            ::std::pin::Pin::new_unchecked(&mut **$x)
+        };
+    };
+}
+
 #[derive(Debug)]
 pub enum QueueError {
     Error,
@@ -68,27 +91,26 @@ impl<T: fmt::Debug + Send + Sync> CoQueue<T> {
 impl<T: fmt::Debug + Send + Sync> Stream for CoQueue<T> {
     type Item = T;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        unsafe {
-            let this = self.get_unchecked_mut();
-            match this.recv.try_recv() {
-                Ok(QueueState::Terminate) => return Poll::Ready(None),
-                Ok(QueueState::Error(err)) => panic!("{}", err),
-                _ => {}
-            }
+        
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.recv.try_recv() {
+            Ok(QueueState::Terminate) => return Poll::Ready(None),
+            Ok(QueueState::Error(err)) => panic!("{}", err),
+            _ => {}
+        }
 
-            let mut fut = this.yield_value();
-            let fut = Pin::new_unchecked(&mut fut);
+        let fut = this.yield_value();
+        pin_mut!(fut);
 
-            match fut.poll(cx) {
-                Poll::Ready(item) => match item {
-                    QueueState::Spin => return Poll::Pending,
-                    QueueState::Error(e) => panic!("{}", e),
-                    QueueState::Yield(item) => return Poll::Ready(Some(item)),
-                    _ => panic!("no other states possible BUG"),
-                },
+        match fut.poll(cx) {
+            Poll::Ready(item) => match item {
+                QueueState::Spin => return Poll::Pending,
+                QueueState::Error(e) => panic!("{}", e),
+                QueueState::Yield(item) => return Poll::Ready(Some(item)),
                 _ => panic!("no other states possible BUG"),
-            }
-        };
+            },
+            _ => panic!("no other states possible BUG"),
+        }
     }
 }
 
@@ -115,7 +137,10 @@ impl<'a, T: fmt::Debug + Send + Sync> Iterator for CoQueIntoIter<'a, T> {
                 Ok(QueueState::Error(err)) => panic!("{}", err),
                 _ => {}
             }
-            let stream = unsafe { Pin::new_unchecked(&mut *self.start) };
+
+            let stream = &mut self.start;
+            pin_mut!(&mut stream);
+
             match stream.poll_next(&mut cx) {
                 Poll::Ready(Some(res)) => return Some(IterWaker::Item(res)),
                 Poll::Ready(None) => return None,
