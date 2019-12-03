@@ -3,7 +3,7 @@
 [![Build Status](https://travis-ci.com/DevinR528/spans.svg?branch=master)](https://travis-ci.com/DevinR528/co_queue)
 [![Latest Version](https://img.shields.io/crates/v/spans.svg)](https://crates.io/crates/co_queue)
 
-A rust nod to C#'s `ConcurrentQueue`. Provides an infinite streaming iterator that can be pushed to 
+A rust nod to C#'s [`BlockingCollection`](https://michaelscodingspot.com/c-job-queues/). Provides an infinite streaming iterator that can be pushed to 
 from multiple threads a mpsc queue based on crossbeam's `SegQueue`.
 <br>
 Exploration of possible PR to crossbeam or an extension trait crate.
@@ -93,11 +93,33 @@ fn stream_que() {
     }).unwrap();
 }
 ```
-more docs to come!
 
 ## Contribute
 [Pull requests](https://github.com/DevinR528/co_queue/pulls) or [suggestions](https://github.com/DevinR528/co_queue/issues) welcome!
 
+the C# inspiration 
+```C#
+public class BlockingCollectionQueue {
+    private BlockingCollection<object> _jobs = new BlockingCollection<object>();
+ 
+    public BlockingCollectionQueue() {
+        var thread = new Thread(new ThreadStart(OnStart));
+        thread.IsBackground = true;
+        thread.Start();
+    }
+ 
+    public void Enqueue(object job) {
+        _jobs.Add(job);
+    }
+ 
+    private void OnStart() {
+        foreach (var job in _jobs.GetConsumingEnumerable(CancellationToken.None)) {
+            Console.WriteLine(job);
+        }
+    }
+}
+```
+[credit](https://michaelscodingspot.com/c-job-queues/)
 #### License
 <sup>
 Licensed under either of <a href="LICENSE-APACHE">Apache License, Version
