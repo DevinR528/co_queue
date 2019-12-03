@@ -1,17 +1,10 @@
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop};
-use std::pin::Pin;
 use std::ptr;
-use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvError, SendError, Sender};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::thread;
-
-use futures_core::stream::Stream;
+use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::backoff::Backoff;
 use crate::cahch_pad::CachePad;
@@ -79,11 +72,11 @@ impl<T> Chunk<T> {
             if slot.state.load(Ordering::Acquire) & READ == 0
                 && slot.state.fetch_or(DESTROY, Ordering::AcqRel) & READ == 0
             {
-                println!("no drop still in use");
+                // println!("no drop still in use");
                 return;
             }
         }
-        println!("drop not in use");
+        // println!("drop not in use");
         drop(Box::from_raw(this))
     }
 }
@@ -93,15 +86,6 @@ impl<T> Chunk<T> {
 pub struct Segment<T> {
     index: AtomicUsize,
     chunk: AtomicPtr<Chunk<T>>,
-}
-
-impl<T> Segment<T> {
-    fn new() -> Segment<T> {
-        Self {
-            index: AtomicUsize::new(0),
-            chunk: AtomicPtr::new(ptr::null_mut()),
-        }
-    }
 }
 
 /// TODO ordering will be important
@@ -386,6 +370,7 @@ impl<T> Drop for CoQueue<T> {
 mod tests {
     use super::*;
     use crossbeam::scope;
+    use std::thread;
     use std::time::Duration;
 
     #[test]
@@ -410,7 +395,6 @@ mod tests {
                 for i in 0..=COUNT {
                     q.push(i);
                 }
-                println!("DONE");
             });
         })
         .unwrap();
@@ -454,7 +438,7 @@ mod tests {
 
     #[test]
     fn ordering() {
-        let arr: &[AtomicPtr<u8>; 5] = &[
+        let arr: &[AtomicPtr<usize>; 5] = &[
             AtomicPtr::new(ptr::null_mut()),
             AtomicPtr::new(ptr::null_mut()),
             AtomicPtr::new(ptr::null_mut()),
@@ -473,13 +457,13 @@ mod tests {
         let _ = scope(|scope| {
             scope.spawn(move |_| unsafe {
                 for i in 0..5 {
-                    let new = Box::into_raw(Box::new(i as u8));
+                    let new = Box::into_raw(Box::new(i as usize));
                     arr[i].store(new, Ordering::Release);
                 }
                 for i in 0..5 {
-                    thread::sleep_ms(100);
+                    thread::sleep(Duration::from_millis(100));
                     let y = arr[i].load(Ordering::Acquire);
-                    println!("{:?}", y.as_ref());
+                    assert_eq!(Some(&i), y.as_ref())
                 }
             });
         })

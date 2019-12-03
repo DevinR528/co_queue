@@ -6,6 +6,9 @@ rust:
   - beta
   - stable
 
+before-script:
+  - rustup component add rustfmt
+
 script:
-  - cargo check
   - cargo fmt --all -- --check
+  - cargo t

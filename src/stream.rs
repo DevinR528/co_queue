@@ -1,20 +1,12 @@
-use std::cell::UnsafeCell;
 use std::fmt;
 use std::future::Future;
-use std::marker::PhantomData;
-use std::mem::{self, ManuallyDrop};
 use std::pin::Pin;
-use std::ptr;
-use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvError, SendError, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::mpsc::Sender;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
-use std::thread;
 
 use futures_core::stream::Stream;
 
-use crate::backoff::Backoff;
-use crate::cahch_pad::CachePad;
 use crate::waker;
 use crate::CoQueue;
 
@@ -43,7 +35,7 @@ struct FutureStreamOwn<'a, T>(&'a mut CoQueue<T>);
 
 impl<'a, T: fmt::Debug + Send + Sync> Future for FutureStreamOwn<'a, T> {
     type Output = QueueState<T>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         unsafe {
             let this = self.get_unchecked_mut();
 
@@ -65,12 +57,6 @@ impl<T: fmt::Debug + Send + Sync> CoQueue<T> {
         FutureStreamOwn(self)
     }
 
-    pub fn iter(&self) -> CoQueueIter<'_, T> {
-        CoQueueIter {
-            start: self,
-            item: None,
-        }
-    }
     pub fn into_iter(&mut self) -> CoQueIntoIter<T> {
         CoQueIntoIter { start: self }
     }
@@ -150,16 +136,16 @@ mod tests {
 
     use super::*;
 
+    use std::sync::RwLock;
+    use std::thread;
+    use std::time::Duration;
+
     use crossbeam::scope;
     use futures::StreamExt;
-    use std::time::Duration;
 
     #[test]
     fn stream_que() {
-        let mut x = 0;
-
         let que = CoQueue::new();
-        let sender = que.sender();
 
         let mut thread_que: RwLock<CoQueue<u8>> = RwLock::new(que);
 
@@ -213,8 +199,9 @@ mod tests {
 
         scope(|scope| {
             scope.spawn(|_| {
-                for (i, item) in thread_que.get_mut().unwrap().into_iter().enumerate() {
+                for item in thread_que.get_mut().unwrap().into_iter() {
                     thread::sleep(Duration::from_millis(100));
+
                     if let IterWaker::Item(i) = item {
                         assert!(i <= 4);
                     }

@@ -40,6 +40,7 @@ impl<T> CachePad<T> {
         CachePad::<T> { value: t }
     }
 
+    #[allow(dead_code)]
     pub fn into_inner(self) -> T {
         self.value
     }

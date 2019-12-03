@@ -38,7 +38,7 @@ fn streaming_iter_que() {
                 thread::sleep(Duration::from_millis(300));
                 thread_que.write().unwrap().push(i);
             }
-            println!("{:?}", thread_que.read().unwrap().len());
+            assert_eq!(10, thread_que.read().unwrap().len());
         });
     })
     .unwrap();
@@ -73,7 +73,6 @@ fn stream_que() {
 
     scope(|scope| {
         scope.spawn(|_| {
-            // thread::sleep(Duration::from_millis(100));
             for i in 0..5 {
                 thread_que.write().unwrap().push(i);
             }
@@ -82,7 +81,6 @@ fn stream_que() {
     }).unwrap();
     scope(|scope| {
         scope.spawn(|_| {
-            // thread::sleep(Duration::from_millis(100));
             for _ in 0..5  {
                 futures::executor::block_on(async {
                     let res = thread_que.get_mut().unwrap().next().await;

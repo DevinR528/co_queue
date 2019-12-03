@@ -14,12 +14,13 @@ impl Backoff {
         Self { step: Cell::new(0) }
     }
 
+    #[allow(dead_code)]
     pub fn reset(&self) {
         self.step.set(0)
     }
 
     pub fn spin(&self) {
-        println!("spin for {}", 1 << self.step.get().min(SPIN_LIMIT));
+        // println!("spin for {}", 1 << self.step.get().min(SPIN_LIMIT));
         for _ in 0..1 << self.step.get().min(SPIN_LIMIT) {
             atomic::spin_loop_hint();
         }
@@ -34,7 +35,7 @@ impl Backoff {
                 atomic::spin_loop_hint();
             }
         } else {
-            println!("yield now");
+            // println!("yield now");
             ::std::thread::yield_now();
         }
 
