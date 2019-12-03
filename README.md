@@ -30,24 +30,35 @@ fn streaming_iter_que() {
     scope(|scope| {
         scope.spawn(|_| {
             for i in 0..5 {
+                thread::sleep(Duration::from_millis(100));
+                thread_que.write().unwrap().push(i);
+            }
+            
+            for i in 0..5 {
+                thread::sleep(Duration::from_millis(300));
                 thread_que.write().unwrap().push(i);
             }
             println!("{:?}", thread_que.read().unwrap().len());
         });
-
-    }).unwrap();
+    })
+    .unwrap();
 
     scope(|scope| {
         scope.spawn(|_| {
-            thread::sleep(Duration::from_millis(100));
-            for (i, res) in thread_que.get_mut().unwrap().into_iter().enumerate()  {
-                if i == 5 {
+            
+            for (i, item) in thread_que.get_mut().unwrap().into_iter().enumerate() {
+                x += 1;
+                thread::sleep(Duration::from_millis(100));
+                if let IterWaker::Item(i) = item {
+                    println!("item {}", i)
+                }
+                if x > 11 {
                     sender.lock().unwrap().send(QueueState::Terminate).unwrap();
                 }
-                println!("{:?}", res);
             }
         });
-    }).unwrap();
+    })
+    .unwrap();
 }
 ```
 ### Stream

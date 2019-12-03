@@ -262,39 +262,6 @@ mod tests {
     }
 
     #[test]
-    fn block_stream_que() {
-        let mut x = 0;
-
-        let que = CoQueue::new();
-        let sender = que.sender();
-
-        let mut thread_que: RwLock<CoQueue<u8>> = RwLock::new(que);
-
-        scope(|scope| {
-            scope.spawn(|_| {
-                // thread::sleep(Duration::from_millis(100));
-                for i in 0..5 {
-                    thread_que.write().unwrap().push(i);
-                }
-            });
-        })
-        .unwrap();
-        scope(|scope| {
-            scope.spawn(|_| {
-                // thread::sleep(Duration::from_millis(100));
-                let x = futures::executor::block_on_stream(
-                    thread_que.get_mut().unwrap()
-                        .chunks(4)
-                );
-                println!("{:?}", x);
-                let y = thread_que.get_mut().unwrap().collect::<Vec<_>>();
-                println!("{:?}", y);
-            });
-        })
-        .unwrap();
-    }
-
-    #[test]
     fn streaming_iter_que() {
         let mut x = 0;
 
@@ -324,20 +291,15 @@ mod tests {
         scope(|scope| {
             scope.spawn(|_| {
                 
-                for (i, res) in thread_que.get_mut().unwrap().into_iter().enumerate() {
-                    thread::sleep(Duration::from_millis(100));
-                    match res {
-                        IterWaker::Item(i) => {
-                            println!("item {}", i)
-                        },
-                        _ => {},
-                    }
+                for (i, item) in thread_que.get_mut().unwrap().into_iter().enumerate() {
                     x += 1;
-                    println!("x = {}", x);
+                    thread::sleep(Duration::from_millis(100));
+                    if let IterWaker::Item(i) = item {
+                        println!("item {}", i)
+                    }
                     if x > 11 {
                         sender.lock().unwrap().send(QueueState::Terminate).unwrap();
                     }
-                    println!("{:?}", res);
                 }
             });
         })
