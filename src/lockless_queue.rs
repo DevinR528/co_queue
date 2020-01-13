@@ -94,12 +94,18 @@ pub struct CoQueue<T> {
     head: CachePad<Segment<T>>,
     tail: CachePad<Segment<T>>,
     pub(crate) recv: Receiver<QueueState<T>>,
-    pub(crate) temp_tx: Sender<QueueState<T>>,
+    pub(crate) send: Sender<QueueState<T>>,
     _mkr: PhantomData<T>,
 }
 
 unsafe impl<T: Send> Send for CoQueue<T> {}
 unsafe impl<T: Sync> Sync for CoQueue<T> {}
+
+impl<T> Default for CoQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl<T> CoQueue<T> {
     pub fn new() -> CoQueue<T> {
@@ -114,7 +120,7 @@ impl<T> CoQueue<T> {
                 index: AtomicUsize::new(0),
             }),
             recv,
-            temp_tx: tx,
+            send: tx,
             _mkr: PhantomData,
         }
     }
@@ -454,7 +460,7 @@ mod tests {
         //         }
         //     }
         // }
-        let _ = scope(|scope| {
+        scope(|scope| {
             scope.spawn(move |_| unsafe {
                 for i in 0..5 {
                     let new = Box::into_raw(Box::new(i as usize));

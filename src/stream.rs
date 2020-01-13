@@ -10,6 +10,7 @@ use futures_core::stream::Stream;
 use crate::waker;
 use crate::CoQueue;
 
+#[macro_export]
 macro_rules! pin_mut {
     ($x:ident) => {
         // Move the value to ensure that it is owned
@@ -17,9 +18,7 @@ macro_rules! pin_mut {
         // Shadow the original binding so that it can't be directly accessed
         // ever again.
         #[allow(unused_mut)]
-        let mut $x = unsafe {
-            ::std::pin::Pin::new_unchecked(&mut $x)
-        };
+        let mut $x = unsafe { ::std::pin::Pin::new_unchecked(&mut $x) };
     };
     (&mut $x:ident) => {
         // Move the value to ensure that it is owned
@@ -27,9 +26,7 @@ macro_rules! pin_mut {
         // Shadow the original binding so that it can't be directly accessed
         // ever again.
         #[allow(unused_mut)]
-        let mut $x = unsafe {
-            ::std::pin::Pin::new_unchecked(&mut **$x)
-        };
+        let mut $x = unsafe { ::std::pin::Pin::new_unchecked(&mut **$x) };
     };
 }
 
@@ -54,6 +51,20 @@ pub enum QueueState<T> {
     Terminate,
 }
 
+impl<T: fmt::Debug + Send + Sync> CoQueue<T> {
+    fn yield_value(&mut self) -> impl Future<Output = QueueState<T>> + '_ {
+        FutureStreamOwn(self)
+    }
+
+    pub fn into_iter(&mut self) -> CoQueIntoIter<T> {
+        CoQueIntoIter { start: self }
+    }
+
+    pub fn sender(&self) -> Mutex<Sender<QueueState<T>>> {
+        Mutex::new(self.send.clone())
+    }
+}
+
 struct FutureStreamOwn<'a, T>(&'a mut CoQueue<T>);
 
 impl<'a, T: fmt::Debug + Send + Sync> Future for FutureStreamOwn<'a, T> {
@@ -62,7 +73,7 @@ impl<'a, T: fmt::Debug + Send + Sync> Future for FutureStreamOwn<'a, T> {
         unsafe {
             let this = self.get_unchecked_mut();
 
-            if this.0.len() != 0 {
+            if !this.0.is_empty() {
                 if let Ok(item) = this.0.pop() {
                     Poll::Ready(QueueState::Yield(item))
                 } else {
@@ -75,23 +86,9 @@ impl<'a, T: fmt::Debug + Send + Sync> Future for FutureStreamOwn<'a, T> {
     }
 }
 
-impl<T: fmt::Debug + Send + Sync> CoQueue<T> {
-    fn yield_value(&mut self) -> impl Future<Output = QueueState<T>> + '_ {
-        FutureStreamOwn(self)
-    }
-
-    pub fn into_iter(&mut self) -> CoQueIntoIter<T> {
-        CoQueIntoIter { start: self }
-    }
-    pub fn sender(&self) -> Mutex<Sender<QueueState<T>>> {
-        Mutex::new(self.temp_tx.clone())
-    }
-}
-
 impl<T: fmt::Debug + Send + Sync> Stream for CoQueue<T> {
     type Item = T;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        
         let this = unsafe { self.get_unchecked_mut() };
         match this.recv.try_recv() {
             Ok(QueueState::Terminate) => return Poll::Ready(None),

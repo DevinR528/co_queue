@@ -9,6 +9,14 @@ edition = "2018"
 [dependencies]
 futures = "0.3"
 futures-core = "0.3"
+num_cpus = "1.11"
+lazy_static = "1.4"
+parking_lot = {version = "0.10", features = ["deadlock_detection"]}
+libc = "0.2"
+smallvec = "1.1"
+backtrace = "0.3"
+petgraph = "0.5"
+thread-id = "3.3"
 
 [dev-dependencies]
 crossbeam = "0.7"

@@ -6,8 +6,7 @@ use std::{
 /// Creates a vtable that has fn pointers to no-op functions
 ///
 /// # Safety
-/// Doing nothing is always a good safe thing to do, just sit and watch tv
-/// don't go try something new and scary?!
+/// Doing nothing is always a good safe thing to do, keep it safe.
 pub fn create() -> Waker {
     unsafe { Waker::from_raw(RAW_WAKER) }
 }
