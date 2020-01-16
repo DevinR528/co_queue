@@ -6,11 +6,13 @@ use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering::*};
 use std::sync::Condvar;
 use std::sync::Once;
 
+use crossbeam::epoch::{self, Atomic, Guard, Owned, Shared, Pointer};
+
 use super::num_threads;
 pub use crate::{MapMootexGuard, Mootex, MootexGuard};
 
 pub struct PtrGuard<T> {
-    guard: AtomicPtr<T>,
+    guard: Atomic<T>,
     cap: usize,
     len: AtomicUsize,
     lock: Mootex<()>,
@@ -18,9 +20,10 @@ pub struct PtrGuard<T> {
 
 impl<T: fmt::Debug> fmt::Debug for PtrGuard<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let g = unsafe { epoch::unprotected() }; 
         let mut v = Vec::default();
         unsafe {
-            let ptr = self.guard.load(SeqCst);
+            let ptr = self.guard.load(SeqCst, &g).as_raw();
             for x in 0..self.len() {
                 v.push(ptr::read(ptr.add(x)))
             }
@@ -37,9 +40,9 @@ impl<T: fmt::Debug> fmt::Debug for PtrGuard<T> {
 impl<T> PtrGuard<T> {
     pub fn new() -> PtrGuard<T> {
         let cap = num_threads();
-        let mut data = Vec::with_capacity(cap);
-        let guard = AtomicPtr::new(data.as_mut_ptr());
-        mem::forget(data);
+        let space: *mut Vec<T> = Vec::with_capacity(cap).as_mut_ptr();
+
+        let guard = Atomic::null();
         Self {
             guard,
             cap,
@@ -48,9 +51,7 @@ impl<T> PtrGuard<T> {
         }
     }
     pub fn with_threads(threads: usize) -> PtrGuard<T> {
-        let mut data = Vec::with_capacity(threads);
-        let guard = AtomicPtr::new(data.as_mut_ptr());
-        mem::forget(data);
+        let guard = Atomic::null();
         Self {
             guard,
             cap: threads,
@@ -73,23 +74,23 @@ impl<T> PtrGuard<T> {
     pub fn is_empty(&self) -> bool {
         self.len.load(Relaxed) == 0
     }
-    pub fn push(&self, node: T) -> Result<(), T> {
+    pub fn push(&self, node: T, g: &Guard) -> Result<(), T> {
         let len = self.len.load(Acquire);
         if len == self.cap {
             Err(node)
         } else {
-            let guard = self.guard.load(SeqCst);
+            let guard = self.guard.load(SeqCst, g).as_raw() as *mut T;
             unsafe { ptr::write(guard.add(len), node) };
             self.len.compare_and_swap(len, len + 1, Release);
             Ok(())
         }
     }
-    pub fn pop(&self) -> Result<T, ()> {
+    pub fn pop(&self, g: &Guard) -> Result<T, ()> {
         let len = self.len.load(Acquire);
         if len == 0 {
             Err(())
         } else {
-            let guard = self.guard.load(SeqCst);
+            let guard = self.guard.load(SeqCst, &g).as_raw() as *mut T;
             self.len.compare_and_swap(len, len - 1, Release);
             unsafe { Ok(ptr::read(guard.add(len))) }
         }
