@@ -1,19 +1,19 @@
 use std::cell::UnsafeCell;
-use std::sync::Once;
-use std::ops::{Deref, DerefMut};
-use std::marker::PhantomData;
 use std::fmt;
-use std::mem::{self, MaybeUninit, ManuallyDrop};
+use std::marker::PhantomData;
+use std::mem::{self, ManuallyDrop, MaybeUninit};
+use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering::*};
 use std::sync::Condvar;
+use std::sync::Once;
 
 mod own_ref;
 mod shift_guard;
 
-pub use crate::{Mootex, MootexGuard, MapMootexGuard};
-use shift_guard::{PtrGuard, pg, pg_with};
+pub use crate::{MapMootexGuard, Mootex, MootexGuard};
 use own_ref::{Owned, Shared};
+use shift_guard::{pg, pg_with, PtrGuard};
 // lazy_static::lazy_static! { static ref THREADS: usize = num_cpus::get(); }
 
 pub(super) static mut THREADS: usize = 0;
@@ -40,8 +40,16 @@ pub(crate) struct Node<T> {
 
 impl<T: fmt::Debug> fmt::Debug for Node<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let next = if self.next().is_null() { &"null" as &dyn fmt::Debug } else { unsafe { &*self.next() as &dyn fmt::Debug }};
-        let data = if self.data.is_null() { &"null" as &dyn fmt::Debug } else { unsafe { &*self.data as &dyn fmt::Debug }};
+        let next = if self.next().is_null() {
+            &"null" as &dyn fmt::Debug
+        } else {
+            unsafe { &*self.next() as &dyn fmt::Debug }
+        };
+        let data = if self.data.is_null() {
+            &"null" as &dyn fmt::Debug
+        } else {
+            unsafe { &*self.data as &dyn fmt::Debug }
+        };
         f.debug_struct("Node")
             .field("data", data)
             .field("next", next)
@@ -84,7 +92,7 @@ pub(crate) struct RawQueue<T> {
     /// Atomic pointer to a node that is the tail.
     tail: AtomicPtr<Node<T>>,
     /// TODO safe/better abstraction around PtrGuard<*const ...> yuck
-    /// 
+    ///
     /// The idea is to make a safe window around memory
     /// for mutation, insertion and/or removal.
     push_guard: PtrGuard<*const Node<T>>,
@@ -106,7 +114,7 @@ impl<T: fmt::Debug> fmt::Debug for RawQueue<T> {
             loop {
                 if (&*head).next().is_null() {
                     v.push(&"null" as &dyn fmt::Debug);
-                    break
+                    break;
                 };
                 head = (*head).next.load(SeqCst);
                 v.push(&*head as &dyn fmt::Debug);
@@ -162,24 +170,39 @@ impl<T: fmt::Debug> RawQueue<T> {
         // if not null and the tail is the tail we have entered half way through an insert
         // we simply finish the process by making tail point correctly to new_node.
         if !next.is_null() {
-            match self.tail.compare_exchange(tail, new_node.as_mut_ptr(), Release, Relaxed) {
+            match self
+                .tail
+                .compare_exchange(tail, new_node.as_mut_ptr(), Release, Relaxed)
+            {
                 Ok(_null) => true,
                 Err(_n) => {
                     println!("next null error");
-                    if self.push_guard.push(new_node.as_ptr()).is_err() { panic!("push_guard failed to push") };
+                    if self.push_guard.push(new_node.as_ptr()).is_err() {
+                        panic!("push_guard failed to push")
+                    };
                     false
-                },
+                }
             }
         } else {
             println!("{:?}", new_node);
             // this is common path next is null so we swap new_node for it and shift tail to new_node
             if self.push_guard.is_empty() && (*tail).next().is_null() {
-                match (*tail).next.compare_exchange((*tail).next(), new_node.as_mut_ptr(), Release, Relaxed) {
+                match (*tail).next.compare_exchange(
+                    (*tail).next(),
+                    new_node.as_mut_ptr(),
+                    Release,
+                    Relaxed,
+                ) {
                     Ok(_null) => {
-                        let res = self.tail.compare_exchange(tail, new_node.as_mut_ptr(), Release, Relaxed);
+                        let res = self.tail.compare_exchange(
+                            tail,
+                            new_node.as_mut_ptr(),
+                            Release,
+                            Relaxed,
+                        );
                         assert!(res.is_ok(), "swap to new tail failed");
                         true
-                    },
+                    }
                     Err(_n) => false,
                 }
             } else {
@@ -191,17 +214,27 @@ impl<T: fmt::Debug> RawQueue<T> {
                     // TODO safe?? yuck??
                     let guard_node: &mut Node<T> = &mut *(gn as *mut _);
                     if (*tail).next().is_null() {
-                        match (*tail).next.compare_exchange((*tail).next(), guard_node.as_mut_ptr(), Release, Relaxed) {
+                        match (*tail).next.compare_exchange(
+                            (*tail).next(),
+                            guard_node.as_mut_ptr(),
+                            Release,
+                            Relaxed,
+                        ) {
                             Ok(_null) => {
-                                let res = self.tail.compare_exchange(tail, guard_node.as_mut_ptr(), Release, Relaxed);
+                                let res = self.tail.compare_exchange(
+                                    tail,
+                                    guard_node.as_mut_ptr(),
+                                    Release,
+                                    Relaxed,
+                                );
                                 assert!(res.is_ok(), "swap to new tail failed");
                                 tail = self.tail.load(Relaxed);
                                 continue;
-                            },
+                            }
                             Err(_n) => {
                                 println!("cmp_exc tail and push_guard {:#?}", self);
                                 return false;
-                            },
+                            }
                         }
                     }
                 }
@@ -223,7 +256,8 @@ impl<T: fmt::Debug> RawQueue<T> {
         let next = (*head).next();
 
         if !next.is_null() {
-            self.head.compare_exchange(head, next, Release, Relaxed)
+            self.head
+                .compare_exchange(head, next, Release, Relaxed)
                 .map(|_| Some(ptr::read((*next).data)))
                 .map_err(|_| {
                     println!("cmp_exc head with next _pop {:#?}", self);
@@ -257,12 +291,14 @@ impl<T: fmt::Debug> Default for ShiftQueue<T> {
 impl<T: fmt::Debug> ShiftQueue<T> {
     /// Creates a `ShiftQueue` with `PtrGuard` capacity of `num_cpus::get()`
     /// as the thread count.
-    /// 
+    ///
     /// `ShiftQueue` can be acted upon by `threads` number
     /// of threads. This is an optimization so getting the number
     /// wrong is not catastrophic.
     pub fn new() -> ShiftQueue<T> {
-        Self { raw: RawQueue::new(), }
+        Self {
+            raw: RawQueue::new(),
+        }
     }
     /// Creates `ShiftQueue` that can be acted upon by `threads` number
     /// of threads. This is an optimization so getting the number
@@ -318,14 +354,12 @@ mod tests {
         assert!(guard.is_empty());
     }
 
-
     #[test]
     fn push_try_pop_many_seq() {
         let q: ShiftQueue<u8> = ShiftQueue::new();
         assert!(q.is_empty());
         for i in 0..200 {
             q.push(i);
-            
         }
         println!("{:#?}", q);
         assert!(!q.is_empty());
