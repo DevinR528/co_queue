@@ -59,8 +59,7 @@ pub struct Owned<T> {
 
 impl<T> Owned<T> {
     pub fn new(val: T) -> Owned<T> {
-        let data = Box::into_raw(Box::new(val));
-        Self::from_raw(data)
+        Self::from_raw(Box::into_raw(Box::new(val)))
     }
     pub fn from_raw(data: *mut T) -> Owned<T> {
         ensure_aligned(data);
@@ -88,14 +87,9 @@ impl<T> Owned<T> {
     pub fn is_null(&self) -> bool {
         self.as_raw().is_null()
     }
-    // pub fn into_shared<'s>(self) -> Shared<'s, T> {
-    //     println!("into_shared {:?}", self);
-    //     Shared::from_raw(self.data as *const T)
-    // }
 }
 impl<T: fmt::Debug> Owned<T> {
     pub fn into_shared<'s>(self) -> Shared<'s, T> {
-        println!("into_shared {:?}", self.data);
         Shared::from_raw(self.data as *const T)
     }
 }
@@ -115,7 +109,8 @@ impl<T: fmt::Debug> fmt::Debug for Owned<T> {
 
 impl<T> Drop for Owned<T> {
     fn drop(&mut self) {
-        unsafe { drop(Box::from_raw(self.data as *mut T)) }
+        let raw = decompose_data::<T>(self.data);
+        unsafe { drop(Box::from_raw(raw)) }
     }
 }
 
@@ -174,7 +169,6 @@ pub struct Shared<'s, T> {
 }
 
 impl<'s, T> Shared<'s, T> {
-    
     pub fn null() -> Self {
         Self {
             data: 0,
@@ -191,16 +185,12 @@ impl<'s, T> Shared<'s, T> {
 impl<'s, T: fmt::Debug> Shared<'s, T> {
     pub fn from_raw(data: *const T) -> Shared<'s, T> {
         ensure_aligned(data);
-        unsafe { println!("from raw {:?}", *data) };
-        let s = Shared {
+        Shared {
             data: data as usize,
             _mk: PhantomData,
-        };
-        println!("from raw shared {:?}", s);
-        s
+        }
     }
     pub fn into_owned(self) -> Owned<T> {
-        unsafe { println!("into owned {:?}", *self.as_raw()) };
         Owned::from_usize(self.data)
     }
 }
@@ -220,13 +210,10 @@ impl<'s, T: fmt::Debug> fmt::Debug for Shared<'s, T> {
 
 impl<'s, T: fmt::Debug> Clone for Shared<'s, T> {
     fn clone(&self) -> Self {
-        println!("CLONE OF {:?}", self);
-        let s = Self {
+        Self {
             data: self.data,
             _mk: PhantomData,
-        };
-        println!("COPY OF {:?}", s);
-        s
+        }
     }
 }
 

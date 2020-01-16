@@ -31,11 +31,9 @@ pub(super) fn num_threads() -> usize {
 
 pub(crate) struct Node<T> {
     /// raw pointer to data since every node is wrapped in an atomic.
-    data: UnsafeCell<T>,
+    data: ManuallyDrop<UnsafeCell<T>>,
     /// atomic pointers to next.
     next: AtomicPtr<Node<T>>,
-    /// owns T.
-    _mk: PhantomData<T>,
 }
 
 impl<T: fmt::Debug> fmt::Debug for Node<T> {
@@ -59,27 +57,25 @@ impl<T: fmt::Debug> fmt::Debug for Node<T> {
 
 impl<T> Default for Node<T> {
     fn default() -> Self {
+        let inner = unsafe { UnsafeCell::new(mem::uninitialized()) };
+        let data = ManuallyDrop::new(inner);
         Node {
-            data: UnsafeCell::new(MaybeUninit::uninit().assume_init()),
+            data,
             next: AtomicPtr::default(),
-            _mk: PhantomData,
         }
     }
 }
 
 impl<T: fmt::Debug> Node<T> {
     fn new(val: T) -> Node<T> {
-        let data = Box::into_raw(Box::new(val));
-        let n = Self {
+        let inner = UnsafeCell::new(val);
+        let data = ManuallyDrop::new(inner);
+        Self {
             data,
             next: AtomicPtr::default(),
-            _mk: PhantomData,
-        };
-        println!("being boxed {:?}", n);
-        n
+        }
     }
     fn as_mut_ptr(&mut self) -> *mut Node<T> {
-        println!("as ptr mut {:?}", self);
         self as *mut _
     }
 
@@ -109,7 +105,6 @@ impl<T: fmt::Debug> Default for RawQueue<T> {
 }
 impl<T: fmt::Debug> fmt::Debug for RawQueue<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        //let mut v: Vec<&Node<T>> = Vec::default();
         let mut v = Vec::default();
         unsafe {
             let mut head = self.head.load(SeqCst);
@@ -126,7 +121,7 @@ impl<T: fmt::Debug> fmt::Debug for RawQueue<T> {
         f.debug_struct("RawQueue")
             .field("push_guard", &self.push_guard)
             .field("pop_guard", &self.pop_guard)
-            .field("data", &v)
+            //.field("data", &v)
             .finish()
     }
 }
@@ -135,7 +130,11 @@ impl<T: fmt::Debug> RawQueue<T> {
         // this can never be accessed as an actual Node<T>
         // it is UB but we need an empty node
         // TODO would Option work
-        let mut empty = Node::default();
+        let mut empty = Node {
+            data: unsafe { mem::uninitialized() },
+            next: AtomicPtr::default(),
+
+        };
 
         let raw_q = Self {
             head: AtomicPtr::new(ptr::null_mut()),
@@ -172,11 +171,16 @@ impl<T: fmt::Debug> RawQueue<T> {
         // if not null and the tail is the tail we have entered half way through an insert
         // we simply finish the process by making tail point correctly to new_node.
         if !next.is_null() {
+            println!("not null");
             match self
                 .tail
                 .compare_exchange(tail, new_node.as_mut_ptr(), Release, Relaxed)
             {
-                Ok(_null) => true,
+                Ok(_null) => {
+                    unsafe { println!("TAIL {:#?}", &*self.tail.load(SeqCst)) };
+                    unsafe { println!("HEAD {:#?}", &*self.head.load(SeqCst)) };
+                    true
+                },
                 Err(_n) => {
                     println!("next null error");
                     if self.push_guard.push(new_node.as_raw()).is_err() {
@@ -186,7 +190,7 @@ impl<T: fmt::Debug> RawQueue<T> {
                 }
             }
         } else {
-            // println!("{:?}", new_node);
+            println!("in _push common path {:?}", new_node);
             // this is common path next is null so we swap new_node for it and shift tail to new_node
             if self.push_guard.is_empty() && (*tail).next().is_null() {
                 match (*tail).next.compare_exchange(
@@ -196,7 +200,7 @@ impl<T: fmt::Debug> RawQueue<T> {
                     Relaxed,
                 ) {
                     Ok(_null) => {
-                        // println!("swap tail");
+                        println!("swap tail");
                         let res = self.tail.compare_exchange(
                             tail,
                             new_node.as_mut_ptr(),
@@ -204,9 +208,13 @@ impl<T: fmt::Debug> RawQueue<T> {
                             Relaxed,
                         );
                         assert!(res.is_ok(), "swap to new tail failed");
+                        unsafe { println!("TAIL {:#?}", self.tail.load(SeqCst)) };
                         true
                     }
-                    Err(_n) => false,
+                    Err(_n) => {
+                        println!("tail swap failed {:?}", _n);
+                        false
+                    }
                 }
             } else {
                 // because of failed bad concurrent pushes we have stolen nodes to push and must do so
@@ -262,7 +270,7 @@ impl<T: fmt::Debug> RawQueue<T> {
         if !next.is_null() {
             self.head
                 .compare_exchange(head, next, Release, Relaxed)
-                .map(|_| Some(ptr::read((*next).data)))
+                .map(|_| Some(ptr::read((*next).data.get())))
                 .map_err(|_| {
                     println!("cmp_exc head with next _pop {:#?}", self);
                 })
