@@ -132,7 +132,7 @@ impl<T: fmt::Debug> RawQueue<T> {
         // TODO would Option work
         let mut empty = Node {
             data: unsafe { mem::uninitialized() },
-            next: AtomicPtr::default(),
+            next: AtomicPtr::new(ptr::null_mut()),
 
         };
 
