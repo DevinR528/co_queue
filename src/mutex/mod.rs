@@ -4,7 +4,9 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 
-use super::raw_mutex::RawMutex;
+mod deadlock;
+mod raw_mutex;
+use raw_mutex::RawMutex;
 
 pub unsafe trait Mutexable {
     /// this is passed back and forth each time a lock is held and
@@ -57,13 +59,37 @@ impl<'a, R: Mutexable + 'a, T: ?Sized + 'a> MapMutexGuard<'a, R, T> {
     }
 }
 
-#[derive(Debug)]
 pub struct MutexGuard<'g, M: Mutexable, T: ?Sized> {
     mutex: &'g SmallMutex<M, T>,
     _mk: PhantomData<(&'g mut T, M)>,
 }
 
 unsafe impl<'g, M: Mutexable + Sync + 'g, T: ?Sized + Sync + 'g> Sync for MutexGuard<'g, M, T> {}
+
+impl<'g, M: Mutexable + 'g, T: ?Sized + 'g> Drop for MutexGuard<'g, M, T> {
+    fn drop(&mut self) {
+        self.mutex.raw.unlock()
+    }
+}
+
+impl<'g, M: Mutexable + 'g, T: ?Sized + 'g> Deref for MutexGuard<'g, M, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.data.get() }
+    }
+}
+
+impl<'g, M: Mutexable + 'g, T: ?Sized + 'g> DerefMut for MutexGuard<'g, M, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.data.get() }
+    }
+}
+
+impl<'g, M: Mutexable + 'g, T: fmt::Debug + ?Sized + 'g> fmt::Debug for MutexGuard<'g, M, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
 
 impl<'g, M: Mutexable + 'g, T: ?Sized + 'g> MutexGuard<'g, M, T> {
     pub fn mutex(s: &Self) -> &'g SmallMutex<M, T> {
@@ -127,6 +153,10 @@ impl<M: Mutexable, T: ?Sized> SmallMutex<M, T> {
     pub fn lock(&self) -> MutexGuard<'_, M, T> {
         self.raw.lock();
         unsafe { self.guard() }
+    }
+
+    pub fn try_lock(&self) -> bool {
+        self.raw.try_lock()
     }
 
     pub fn force_unlock(&self) {

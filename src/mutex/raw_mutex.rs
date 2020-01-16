@@ -5,7 +5,7 @@ use std::{
 
 //use super::deadlock::{acquire_resource, release_resource};
 use super::deadlock::{self, ParkResult, UnparkResult, UnparkToken, DEFAULT_PARK_TOKEN};
-use super::mutex::Mutexable;
+use super::Mutexable;
 
 // UnparkToken used to indicate that that the target thread should attempt to
 // lock the mutex again as soon as it is unparked.
@@ -115,7 +115,14 @@ impl RawMutex {
             };
 
             match unsafe {
-                deadlock::park(addr, validate, || {}, time_out, DEFAULT_PARK_TOKEN, None)
+                deadlock::park(
+                    addr,
+                    validate,
+                    before_sleep,
+                    time_out,
+                    DEFAULT_PARK_TOKEN,
+                    None,
+                )
             } {
                 // The thread that unparked us passed the lock on to us
                 // directly without unlocking it.

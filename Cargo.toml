@@ -17,6 +17,8 @@ smallvec = "1.1"
 backtrace = "0.3"
 petgraph = "0.5"
 thread-id = "3.3"
+crossbeam = "0.7"
+crossbeam-utils = "0.7"
 
 [dev-dependencies]
-crossbeam = "0.7"
+
