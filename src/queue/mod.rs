@@ -121,7 +121,7 @@ impl<T: fmt::Debug> fmt::Debug for RawQueue<T> {
         f.debug_struct("RawQueue")
             .field("push_guard", &self.push_guard)
             .field("pop_guard", &self.pop_guard)
-            //.field("data", &v)
+            .field("data", &v)
             .finish()
     }
 }
@@ -166,6 +166,7 @@ impl<T: fmt::Debug> RawQueue<T> {
 
     unsafe fn _push(&self, mut new_node: Shared<'_, Node<T>>) -> bool {
         let mut tail = self.tail.load(Acquire);
+        let mut head = self.head.load(Acquire);
         let next = (*tail).next();
 
         // if not null and the tail is the tail we have entered half way through an insert
@@ -177,9 +178,24 @@ impl<T: fmt::Debug> RawQueue<T> {
                 .compare_exchange(tail, new_node.as_mut_ptr(), Release, Relaxed)
             {
                 Ok(_null) => {
-                    unsafe { println!("TAIL {:#?}", &*self.tail.load(SeqCst)) };
-                    unsafe { println!("HEAD {:#?}", &*self.head.load(SeqCst)) };
-                    true
+                    unsafe { println!("TAIL {:#?}", self.tail.load(SeqCst)) };
+                    // swap head as well
+                    match self
+                        .head
+                        .compare_exchange(head, new_node.as_mut_ptr(), Release, Relaxed)
+                    {
+                        Ok(_null) => {
+                            unsafe { println!("HEAD {:#?}", self.head.load(SeqCst)) };
+                            true
+                        },
+                        Err(_n) => {
+                            println!("next null error");
+                            if self.push_guard.push(new_node.as_raw()).is_err() {
+                                panic!("push_guard failed to push")
+                            };
+                            false
+                        }
+                    }
                 },
                 Err(_n) => {
                     println!("next null error");
@@ -208,6 +224,7 @@ impl<T: fmt::Debug> RawQueue<T> {
                             Relaxed,
                         );
                         assert!(res.is_ok(), "swap to new tail failed");
+                        unsafe { println!("HEAD {:#?}", self.head.load(SeqCst)) };
                         unsafe { println!("TAIL {:#?}", self.tail.load(SeqCst)) };
                         true
                     }
@@ -373,7 +390,7 @@ mod tests {
         for i in 0..2 {
             q.push(i);
         }
-        println!("{:#?}", q);
+        // println!("{:#?}", q);
         assert!(!q.is_empty());
         for i in 0..2 {
             assert_eq!(q.try_pop(), Some(i));
