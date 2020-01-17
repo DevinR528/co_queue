@@ -12,7 +12,7 @@ mod own_ref;
 mod shift_guard;
 
 pub use crate::{MapMootexGuard, Mootex, MootexGuard};
-use own_ref::{Owned, Shared};
+use own_ref::{Owned, Shared, Pointer, Atomic};
 use shift_guard::{pg, pg_with, PtrGuard};
 // lazy_static::lazy_static! { static ref THREADS: usize = num_cpus::get(); }
 
@@ -31,71 +31,59 @@ pub(super) fn num_threads() -> usize {
 
 pub(crate) struct Node<T> {
     /// raw pointer to data since every node is wrapped in an atomic.
-    data: ManuallyDrop<UnsafeCell<T>>,
+    data: ManuallyDrop<T>,
     /// atomic pointers to next.
-    next: AtomicPtr<Node<T>>,
+    next: Atomic<Node<T>>,
 }
 
 impl<T: fmt::Debug> fmt::Debug for Node<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let next = if self.next().is_null() {
-            &"null" as &dyn fmt::Debug
+        let next = if self.next.load(SeqCst).is_null() {
+            Box::new("null") as Box<dyn fmt::Debug>
         } else {
-            unsafe { &*self.next() as &dyn fmt::Debug }
+            let n = self.next.load(SeqCst);
+            Box::new(n) as Box<dyn fmt::Debug>
         };
-        let data = if self.data.get().is_null() {
-            &"null" as &dyn fmt::Debug
-        } else {
-            unsafe { &*self.data.get() as &dyn fmt::Debug }
-        };
+        let data = self.data.deref();
         f.debug_struct("Node")
             .field("data", data)
-            .field("next", next)
+            .field("next", &next)
             .finish()
     }
 }
 
-impl<T> Default for Node<T> {
+impl<T: fmt::Debug> Default for Node<T> {
+    #[allow(clippy::uninit_assumed_init)]
     fn default() -> Self {
-        let inner = unsafe { UnsafeCell::new(mem::uninitialized()) };
-        let data = ManuallyDrop::new(inner);
-        Node {
-            data,
-            next: AtomicPtr::default(),
-        }
+        let data = unsafe { ManuallyDrop::new(MaybeUninit::uninit().assume_init()) };
+        Node { data, next: Atomic::null() }
     }
 }
 
 impl<T: fmt::Debug> Node<T> {
     fn new(val: T) -> Node<T> {
-        let inner = UnsafeCell::new(val);
-        let data = ManuallyDrop::new(inner);
-        Self {
-            data,
-            next: AtomicPtr::default(),
-        }
+        let data = ManuallyDrop::new(val);
+        Self { data, next: Atomic::null() }
     }
     fn as_mut_ptr(&mut self) -> *mut Node<T> {
         self as *mut _
     }
 
-    fn next(&self) -> *mut Node<T> {
+    fn next(&self) -> Shared<'_, Node<T>> {
         self.next.load(Acquire)
     }
 }
 
-pub(crate) struct RawQueue<T> {
+pub(crate) struct RawQueue<T: fmt::Debug> {
     /// Atomic pointer to a node that is the head.
-    head: AtomicPtr<Node<T>>,
+    head: Atomic<Node<T>>,
     /// Atomic pointer to a node that is the tail.
-    tail: AtomicPtr<Node<T>>,
-    /// TODO safe/better abstraction around PtrGuard<*const ...> yuck
-    ///
+    tail: Atomic<Node<T>>,
     /// The idea is to make a safe window around memory
     /// for mutation, insertion and/or removal.
-    push_guard: PtrGuard<*const Node<T>>,
+    push_guard: PtrGuard<Owned<Node<T>>>,
     /// Tails protection
-    pop_guard: PtrGuard<*const Node<T>>,
+    pop_guard: PtrGuard<Owned<Node<T>>>,
 }
 
 impl<T: fmt::Debug> Default for RawQueue<T> {
@@ -107,13 +95,13 @@ impl<T: fmt::Debug> fmt::Debug for RawQueue<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut v = Vec::default();
         unsafe {
-            let mut head = self.head.load(SeqCst);
+            let mut head = self.head.load(SeqCst).as_raw();
             loop {
                 if (&*head).next().is_null() {
                     v.push(&"null" as &dyn fmt::Debug);
                     break;
                 };
-                head = (*head).next.load(SeqCst);
+                head = (*head).next.load(SeqCst).as_raw();
                 v.push(&*head as &dyn fmt::Debug);
             }
         }
@@ -130,20 +118,16 @@ impl<T: fmt::Debug> RawQueue<T> {
         // this can never be accessed as an actual Node<T>
         // it is UB but we need an empty node
         // TODO would Option work
-        let mut empty = Node {
-            data: unsafe { mem::uninitialized() },
-            next: AtomicPtr::new(ptr::null_mut()),
-
-        };
+        let mut empty = Owned::new(Node::default());
 
         let raw_q = Self {
-            head: AtomicPtr::new(ptr::null_mut()),
-            tail: AtomicPtr::new(ptr::null_mut()),
-            push_guard: pg::<*const Node<T>>(),
-            pop_guard: pg::<*const Node<T>>(),
+            head: Atomic::null(),
+            tail: Atomic::null(),
+            push_guard: pg::<Owned<Node<T>>>(),
+            pop_guard: pg::<Owned<Node<T>>>(),
         };
 
-        let e_ptr = empty.as_mut_ptr();
+        let e_ptr = empty.into_shared();
         raw_q.head.store(e_ptr, Relaxed);
         raw_q.tail.store(e_ptr, Relaxed);
         raw_q
@@ -151,55 +135,38 @@ impl<T: fmt::Debug> RawQueue<T> {
 
     fn with_threads(threads: usize) -> RawQueue<T> {
         Self {
-            head: AtomicPtr::new(ptr::null_mut()),
-            tail: AtomicPtr::new(ptr::null_mut()),
-            push_guard: pg_with::<*const Node<T>>(threads),
-            pop_guard: pg_with::<*const Node<T>>(threads),
+            head: Atomic::null(),
+            tail: Atomic::null(),
+            push_guard: pg_with::<Owned<Node<T>>>(threads),
+            pop_guard: pg_with::<Owned<Node<T>>>(threads),
         }
     }
 
     fn is_empty(&self) -> bool {
         let head = self.head.load(Acquire);
-        let h = unsafe { &*head };
+        let h = head.deref();
         h.next.load(Acquire).is_null()
     }
 
     unsafe fn _push(&self, mut new_node: Shared<'_, Node<T>>) -> bool {
         let mut tail = self.tail.load(Acquire);
-        let mut head = self.head.load(Acquire);
-        let next = (*tail).next();
+        let next = tail.next();
 
         // if not null and the tail is the tail we have entered half way through an insert
         // we simply finish the process by making tail point correctly to new_node.
         if !next.is_null() {
-            println!("not null");
+            println!("next is null");
             match self
                 .tail
-                .compare_exchange(tail, new_node.as_mut_ptr(), Release, Relaxed)
+                .compare_set(tail, new_node, Release)
             {
                 Ok(_null) => {
-                    unsafe { println!("TAIL {:#?}", self.tail.load(SeqCst)) };
-                    // swap head as well
-                    match self
-                        .head
-                        .compare_exchange(head, new_node.as_mut_ptr(), Release, Relaxed)
-                    {
-                        Ok(_null) => {
-                            unsafe { println!("HEAD {:#?}", self.head.load(SeqCst)) };
-                            true
-                        },
-                        Err(_n) => {
-                            println!("next null error");
-                            if self.push_guard.push(new_node.as_raw()).is_err() {
-                                panic!("push_guard failed to push")
-                            };
-                            false
-                        }
-                    }
-                },
+                    println!("TAIL {:#?}", self.tail.load(SeqCst));
+                    true
+                }
                 Err(_n) => {
                     println!("next null error");
-                    if self.push_guard.push(new_node.as_raw()).is_err() {
+                    if self.push_guard.push(new_node.into_owned()).is_err() {
                         panic!("push_guard failed to push")
                     };
                     false
@@ -208,24 +175,22 @@ impl<T: fmt::Debug> RawQueue<T> {
         } else {
             println!("in _push common path {:?}", new_node);
             // this is common path next is null so we swap new_node for it and shift tail to new_node
-            if self.push_guard.is_empty() && (*tail).next().is_null() {
-                match (*tail).next.compare_exchange(
-                    ptr::null_mut(),
-                    new_node.as_mut_ptr(),
+            if self.push_guard.is_empty() && tail.next().is_null() {
+                match tail.next.compare_set(
+                    Shared::null(),
+                    new_node,
                     Release,
-                    Relaxed,
                 ) {
                     Ok(_null) => {
                         println!("swap tail");
-                        let res = self.tail.compare_exchange(
+                        let res = self.tail.compare_set(
                             tail,
-                            new_node.as_mut_ptr(),
+                            new_node,
                             Release,
-                            Relaxed,
                         );
                         assert!(res.is_ok(), "swap to new tail failed");
-                        unsafe { println!("HEAD {:#?}", self.head.load(SeqCst)) };
-                        unsafe { println!("TAIL {:#?}", self.tail.load(SeqCst)) };
+                        println!("HEAD {:#?}", self.head.load(SeqCst));
+                        println!("TAIL {:#?}", self.tail.load(SeqCst));
                         true
                     }
                     Err(_n) => {
@@ -238,26 +203,23 @@ impl<T: fmt::Debug> RawQueue<T> {
                 let _lock = self.push_guard.lock();
                 println!("needed to use PtrGuard {:#?}", self);
                 // these are failed pushes that have to be dealt with first
-                while let Ok(gn) = self.push_guard.pop() {
+                if let Ok(shared) = self.push_guard.pop().map(|n| n.into_shared()) {
                     // TODO safe?? yuck??
-                    let guard_node: &mut Node<T> = &mut *(gn as *mut _);
-                    if (*tail).next().is_null() {
-                        match (*tail).next.compare_exchange(
-                            (*tail).next(),
-                            guard_node.as_mut_ptr(),
+                    if tail.next().is_null() {
+                        match tail.next.compare_set(
+                            tail.next(),
+                            shared,
                             Release,
-                            Relaxed,
                         ) {
                             Ok(_null) => {
-                                let res = self.tail.compare_exchange(
+                                let res = self.tail.compare_set(
                                     tail,
-                                    guard_node.as_mut_ptr(),
+                                    shared,
                                     Release,
-                                    Relaxed,
                                 );
                                 assert!(res.is_ok(), "swap to new tail failed");
                                 tail = self.tail.load(Relaxed);
-                                continue;
+                                return false;
                             }
                             Err(_n) => {
                                 println!("cmp_exc tail and push_guard {:#?}", self);
@@ -275,7 +237,7 @@ impl<T: fmt::Debug> RawQueue<T> {
     fn push(&self, val: T) {
         let node = Owned::new(Node::new(val));
         println!("push {:?}", node);
-        let new = node.into_shared();
+        let new = Owned::into_shared(node);
         println!("push {:?}", new);
         unsafe { while !self._push(new) {} }
     }
@@ -286,8 +248,8 @@ impl<T: fmt::Debug> RawQueue<T> {
 
         if !next.is_null() {
             self.head
-                .compare_exchange(head, next, Release, Relaxed)
-                .map(|_| Some(ptr::read((*next).data.get())))
+                .compare_set(head, next, Release)
+                .map(|_| Some(ptr::read((*next).data.deref())))
                 .map_err(|_| {
                     println!("cmp_exc head with next _pop {:#?}", self);
                 })
@@ -305,9 +267,19 @@ impl<T: fmt::Debug> RawQueue<T> {
     }
 }
 
+impl<T: fmt::Debug> Drop for RawQueue<T> {
+    fn drop(&mut self) {
+        println!("DROP RAW QUEUE");
+        while let Some(_) = self.try_pop() {}
+
+        let head = self.head.load(Relaxed);
+        drop(head.into_owned())
+    }
+}
+
 ///
 #[derive(Debug)]
-pub struct ShiftQueue<T> {
+pub struct ShiftQueue<T: fmt::Debug> {
     raw: RawQueue<T>,
 }
 
