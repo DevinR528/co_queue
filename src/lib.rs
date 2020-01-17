@@ -1,6 +1,5 @@
 #![feature(const_fn)]
 #![feature(ptr_internals, allocator_api, alloc_layout_extra)]
-
 #![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_mut)]

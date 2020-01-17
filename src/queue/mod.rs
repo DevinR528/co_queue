@@ -12,12 +12,14 @@ mod own_ref;
 mod shift_guard;
 
 pub use crate::{MapMootexGuard, Mootex, MootexGuard};
-use own_ref::{Owned, Shared, Pointer, Atomic};
+use own_ref::{Atomic, Owned, Pointer, Shared};
 use shift_guard::{pg, pg_with, PtrGuard};
 // lazy_static::lazy_static! { static ref THREADS: usize = num_cpus::get(); }
 
 pub(super) static mut THREADS: usize = 0;
 pub(super) static THREAD_COUNT: Once = Once::new();
+
+static mut PTR: usize = 0;
 
 pub(super) fn num_threads() -> usize {
     // this is safe as it will only ever be called once
@@ -29,7 +31,7 @@ pub(super) fn num_threads() -> usize {
     }
 }
 
-pub(crate) struct Node<T> {
+pub(crate) struct Node<T: fmt::Debug> {
     /// raw pointer to data since every node is wrapped in an atomic.
     data: ManuallyDrop<T>,
     /// atomic pointers to next.
@@ -52,18 +54,30 @@ impl<T: fmt::Debug> fmt::Debug for Node<T> {
     }
 }
 
+impl<T: fmt::Debug> Drop for Node<T> {
+    fn drop(&mut self) {
+        println!("DROP NODE");
+    }
+}
+
 impl<T: fmt::Debug> Default for Node<T> {
     #[allow(clippy::uninit_assumed_init)]
     fn default() -> Self {
         let data = unsafe { ManuallyDrop::new(MaybeUninit::uninit().assume_init()) };
-        Node { data, next: Atomic::null() }
+        Node {
+            data,
+            next: Atomic::null(),
+        }
     }
 }
 
 impl<T: fmt::Debug> Node<T> {
     fn new(val: T) -> Node<T> {
         let data = ManuallyDrop::new(val);
-        Self { data, next: Atomic::null() }
+        Self {
+            data,
+            next: Atomic::null(),
+        }
     }
     fn as_mut_ptr(&mut self) -> *mut Node<T> {
         self as *mut _
@@ -93,23 +107,11 @@ impl<T: fmt::Debug> Default for RawQueue<T> {
 }
 impl<T: fmt::Debug> fmt::Debug for RawQueue<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut v = Vec::default();
-        unsafe {
-            let mut head = self.head.load(SeqCst).as_raw();
-            loop {
-                if (&*head).next().is_null() {
-                    v.push(&"null" as &dyn fmt::Debug);
-                    break;
-                };
-                head = (*head).next.load(SeqCst).as_raw();
-                v.push(&*head as &dyn fmt::Debug);
-            }
-        }
-
         f.debug_struct("RawQueue")
             .field("push_guard", &self.push_guard)
             .field("pop_guard", &self.pop_guard)
-            .field("data", &v)
+            .field("head", self.head.load(Relaxed).deref())
+            .field("tail", self.tail.load(Relaxed).deref())
             .finish()
     }
 }
@@ -117,7 +119,6 @@ impl<T: fmt::Debug> RawQueue<T> {
     fn new() -> RawQueue<T> {
         // this can never be accessed as an actual Node<T>
         // it is UB but we need an empty node
-        // TODO would Option work
         let mut empty = Owned::new(Node::default());
 
         let raw_q = Self {
@@ -134,12 +135,21 @@ impl<T: fmt::Debug> RawQueue<T> {
     }
 
     fn with_threads(threads: usize) -> RawQueue<T> {
-        Self {
+        // this can never be accessed as an actual Node<T>
+        // it is UB but we need an empty node
+        let mut empty = Owned::new(Node::default());
+
+        let raw_q = Self {
             head: Atomic::null(),
             tail: Atomic::null(),
             push_guard: pg_with::<Owned<Node<T>>>(threads),
             pop_guard: pg_with::<Owned<Node<T>>>(threads),
-        }
+        };
+
+        let e_ptr = empty.into_shared();
+        raw_q.head.store(e_ptr, Relaxed);
+        raw_q.tail.store(e_ptr, Relaxed);
+        raw_q
     }
 
     fn is_empty(&self) -> bool {
@@ -155,46 +165,28 @@ impl<T: fmt::Debug> RawQueue<T> {
         // if not null and the tail is the tail we have entered half way through an insert
         // we simply finish the process by making tail point correctly to new_node.
         if !next.is_null() {
-            println!("next is null");
-            match self
-                .tail
-                .compare_set(tail, new_node, Release)
-            {
-                Ok(_null) => {
-                    println!("TAIL {:#?}", self.tail.load(SeqCst));
-                    true
-                }
+            match self.tail.compare_set(tail, new_node, Release) {
+                Ok(_null) => true,
                 Err(_n) => {
-                    println!("next null error");
                     if self.push_guard.push(new_node.into_owned()).is_err() {
-                        panic!("push_guard failed to push")
+                        panic!("push_guard failed to push {:#?}", self)
                     };
                     false
                 }
             }
         } else {
-            println!("in _push common path {:?}", new_node);
             // this is common path next is null so we swap new_node for it and shift tail to new_node
             if self.push_guard.is_empty() && tail.next().is_null() {
-                match tail.next.compare_set(
-                    Shared::null(),
-                    new_node,
-                    Release,
-                ) {
+                match tail.next.compare_set(Shared::null(), new_node, Release) {
                     Ok(_null) => {
-                        println!("swap tail");
-                        let res = self.tail.compare_set(
-                            tail,
-                            new_node,
-                            Release,
-                        );
+                        let res = self.tail.compare_set(tail, new_node, Release);
                         assert!(res.is_ok(), "swap to new tail failed");
-                        println!("HEAD {:#?}", self.head.load(SeqCst));
-                        println!("TAIL {:#?}", self.tail.load(SeqCst));
                         true
                     }
                     Err(_n) => {
-                        println!("tail swap failed {:?}", _n);
+                        if self.push_guard.push(new_node.into_owned()).is_err() {
+                            panic!("push_guard failed to push {:#?}", self)
+                        };
                         false
                     }
                 }
@@ -206,19 +198,10 @@ impl<T: fmt::Debug> RawQueue<T> {
                 if let Ok(shared) = self.push_guard.pop().map(|n| n.into_shared()) {
                     // TODO safe?? yuck??
                     if tail.next().is_null() {
-                        match tail.next.compare_set(
-                            tail.next(),
-                            shared,
-                            Release,
-                        ) {
+                        match tail.next.compare_set(tail.next(), shared, Release) {
                             Ok(_null) => {
-                                let res = self.tail.compare_set(
-                                    tail,
-                                    shared,
-                                    Release,
-                                );
+                                let res = self.tail.compare_set(tail, shared, Release);
                                 assert!(res.is_ok(), "swap to new tail failed");
-                                tail = self.tail.load(Relaxed);
                                 return false;
                             }
                             Err(_n) => {
@@ -236,9 +219,8 @@ impl<T: fmt::Debug> RawQueue<T> {
 
     fn push(&self, val: T) {
         let node = Owned::new(Node::new(val));
-        println!("push {:?}", node);
         let new = Owned::into_shared(node);
-        println!("push {:?}", new);
+
         unsafe { while !self._push(new) {} }
     }
 
@@ -249,9 +231,21 @@ impl<T: fmt::Debug> RawQueue<T> {
         if !next.is_null() {
             self.head
                 .compare_set(head, next, Release)
-                .map(|_| Some(ptr::read((*next).data.deref())))
-                .map_err(|_| {
-                    println!("cmp_exc head with next _pop {:#?}", self);
+                .map(|old_head| {
+                    // add to pop_guard which acts as garbage collector
+                    if self.pop_guard.push(old_head.into_owned()).is_err() {
+                        // else lock and clear out garbage
+                        let _lock = self.pop_guard.lock();
+                        while let Ok(_popped) = self.pop_guard.pop() {
+                            // TODO do i have to manually drop??
+                        }
+                        // push on to empty guard
+                        assert!(self.pop_guard.push(old_head.into_owned()).is_ok());
+                    };
+                    Some(ptr::read((*next).data.deref()))
+                })
+                .map_err(|new_head| {
+                    println!("cmp_set head with next _pop {:#?}", self);
                 })
         } else {
             Ok(None)
@@ -322,6 +316,7 @@ impl<T: fmt::Debug> ShiftQueue<T> {
         self.raw.try_pop()
     }
     ///
+    #[must_use]
     pub fn pop(&self) -> T {
         loop {
             match self.raw.try_pop() {
@@ -339,7 +334,7 @@ mod tests {
     use crossbeam_utils::thread;
 
     #[test]
-    fn test_ptr_guard() {
+    fn ptr_guard_queue() {
         let guard: PtrGuard<Node<u8>> = pg_with(4);
         for x in 0..4_u8 {
             assert!(guard.push(Node::new(x)).is_ok());
@@ -356,13 +351,22 @@ mod tests {
     }
 
     #[test]
+    fn test_drop() {
+        let ten = Box::new(10);
+        {
+            let q: ShiftQueue<Box<u8>> = ShiftQueue::new();
+            q.push(ten);
+        }
+    }
+
+    #[test]
     fn push_try_pop_many_seq() {
         let q: ShiftQueue<u8> = ShiftQueue::new();
         assert!(q.is_empty());
         for i in 0..2 {
             q.push(i);
         }
-        // println!("{:#?}", q);
+        println!("{:#?}", q);
         assert!(!q.is_empty());
         for i in 0..2 {
             assert_eq!(q.try_pop(), Some(i));
@@ -388,6 +392,44 @@ mod tests {
             for i in 0..CONC_COUNT {
                 q.push(i)
             }
+        })
+        .unwrap();
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn exercise_push_pop_guards() {
+        const COUNT: u32 = 100_u32;
+        let q: ShiftQueue<u32> = ShiftQueue::with_threads(4);
+
+        thread::scope(|scope| {
+            // PUSH THREADS
+            scope.spawn(|_| {
+                for i in 0..COUNT {
+                    q.push(i)
+                }
+            });
+            scope.spawn(|_| {
+                for i in 0..COUNT {
+                    q.push(i)
+                }
+            });
+
+            // POP THREADS
+            scope.spawn(|_| {
+                let mut next = 0;
+                while next < COUNT {
+                    assert_eq!(q.pop(), next);
+                    next += 1;
+                }
+            });
+            scope.spawn(|_| {
+                let mut next = 0;
+                while next < COUNT {
+                    assert_eq!(q.pop(), next);
+                    next += 1;
+                }
+            });
         })
         .unwrap();
         assert!(q.is_empty());

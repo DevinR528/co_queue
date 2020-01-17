@@ -90,14 +90,14 @@ impl<T: fmt::Debug> Atomic<T> {
     where
         P: Pointer<T>,
     {
-        let new = new.into_usize();
-        let curr = curr.into_usize();
-        unsafe { self.data
-            .compare_exchange(curr, new, ord, Ordering::Relaxed)
-                .map(|_| Shared::from_usize(new))
-                .map_err(|_| Shared::from_usize(curr))
+        let new = new.into_usize(); // next
+        let curr = curr.into_usize(); // head
+        unsafe {
+            self.data
+                .compare_exchange(curr, new, ord, Ordering::Relaxed)
+                .map(|_| Shared::from_usize(curr)) // head
+                .map_err(|_| Shared::from_usize(new)) // next
         }
-
     }
 
     pub fn compare_set_weak<'g, P>(
@@ -111,12 +111,12 @@ impl<T: fmt::Debug> Atomic<T> {
     {
         let new = new.into_usize();
         let curr = curr.into_usize();
-        unsafe { self.data
-            .compare_exchange_weak(curr, new, ord, Ordering::Relaxed)
-                .map(|_| Shared::from_usize(new))
-                .map_err(|_| Shared::from_usize(curr))
+        unsafe {
+            self.data
+                .compare_exchange_weak(curr, new, ord, Ordering::Relaxed)
+                .map(|_| Shared::from_usize(curr))
+                .map_err(|_| Shared::from_usize(new))
         }
-
     }
 
     pub fn fetch_add<'g>(&self, val: usize, ord: Ordering) -> Shared<'g, T> {
@@ -167,7 +167,7 @@ pub struct Owned<T> {
     /// to allow this.
     ///
     ///  # Example
-    /// ```rust
+    /// ```ignore
     /// fn push(&self, val: T) {
     ///     let mut node = Node::new(val);
     ///     

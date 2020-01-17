@@ -1,4 +1,4 @@
-use std::alloc::{ Alloc, GlobalAlloc, Layout, Global, handle_alloc_error };
+use std::alloc::{handle_alloc_error, Alloc, Global, GlobalAlloc, Layout};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
@@ -8,8 +8,8 @@ use std::sync::Condvar;
 use std::sync::Once;
 
 use super::num_threads;
+use super::own_ref::{Atomic, Owned, Pointer, Shared};
 pub use crate::{MapMootexGuard, Mootex, MootexGuard};
-use super::own_ref::{Atomic, Shared, Owned, Pointer};
 
 pub struct PtrGuard<T> {
     guard: Atomic<T>,
@@ -38,19 +38,16 @@ impl<T: fmt::Debug> fmt::Debug for PtrGuard<T> {
 
 unsafe fn atomic_ptr<T: fmt::Debug>(cap: usize) -> Atomic<T> {
     let align = mem::align_of::<T>();
-        let item_size = mem::size_of::<T>();
+    let item_size = mem::size_of::<T>();
 
-        let ptr = Global.alloc(Layout::array::<T>(cap).unwrap());
-        // this should only happen if T is misaligned or OOM
-        if ptr.is_err() {
-            handle_alloc_error(Layout::from_size_align_unchecked(
-                cap * item_size,
-                align
-            ))
-        }
+    let ptr = Global.alloc(Layout::array::<T>(cap).unwrap());
+    // this should only happen if T is misaligned or OOM
+    if ptr.is_err() {
+        handle_alloc_error(Layout::from_size_align_unchecked(cap * item_size, align))
+    }
 
-        let ptr = ptr.unwrap();
-        Atomic::from(ptr.as_ptr() as *const T)
+    let ptr = ptr.unwrap();
+    Atomic::from(ptr.as_ptr() as *const T)
 }
 
 impl<T: fmt::Debug> PtrGuard<T> {
